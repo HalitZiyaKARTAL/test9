@@ -176,4 +176,205 @@
                 const subjects = this._state.subjects.filter(s => document.querySelector(`input[name="subject"][value="${s.id}"]`)?.checked);
                 if (subjects.length < 1) return alert("Please select at least one version to test.");
                 
-                this._ui.runBenchmarkBtn.disabled = true; this
+                this._ui.runBenchmarkBtn.disabled = true; this._ui.runBenchmarkBtn.textContent = 'Running...';
+                this._ui.resultsContainer.innerHTML = '';
+                this._ui.progressContainer.innerHTML = 'Generating call data...';
+                this._ui.progressContainer.style.display = 'block';
+
+                setTimeout(() => {
+                    if (!this._state.callData) this._generateCallData();
+                    this._ui.progressContainer.innerHTML = subjects.map((s, i) => `<div class="progress-item"><label>${s.name}</label><div class="progress-bar"><div class="progress-bar-fill" id="progress-fill-${i}"></div></div></div>`).join('');
+                    setTimeout(() => {
+                        const allTimes = this._runSynchronousChunks(subjects);
+                        this._finishBenchmark(allTimes, subjects);
+                    }, 50);
+                }, 50);
+            }
+
+            _runSynchronousChunks(subjects) {
+                const allTimes = subjects.map(() => []);
+                const resetStrategy = document.querySelector('input[name="resetStrategy"]:checked').value;
+                const getCallParams = this._getCallParamsGenerator();
+                const { iterationsPerRun, runsPerType } = this.config;
+                
+                const innerLoop = (subject) => { for (let k = 0; k < iterationsPerRun; k++) { const call = getCallParams(k); subject.func(call[0], call[1]); }};
+                if (resetStrategy === 'perRun') this._state.subjects.forEach(s => s.reset());
+
+                // CORRECTED LOOP ORDER: 70 -> contestants -> 200k
+                for (let j = 0; j < runsPerType; j++) {
+                    subjects.forEach((subject, i) => {
+                        if (resetStrategy === 'perSample') subject.reset();
+                        const start = performance.now();
+                        try { 
+                            innerLoop(subject); 
+                            allTimes[i].push(performance.now() - start);
+                        } catch (e) { 
+                            allTimes[i].push(0); 
+                            console.error(`Benchmark for ${subject.name} failed:`, e); 
+                        }
+                    });
+                }
+                
+                subjects.forEach((_, i) => { document.getElementById(`progress-fill-${i}`).style.width = '100%'; });
+                return allTimes;
+            }
+
+            _getCallParamsGenerator() {
+                 const scenario = document.querySelector('input[name="scenario"]:checked').value;
+                 switch (scenario) {
+                    case 'repeated': return () => [1, 8];
+                    case 'sequential': return (k) => [1, (k % 63) + 1];
+                    case 'predictable_random': return (k) => this._state.callData.predictableRandom[k % this._state.callData.predictableRandom.length];
+                    case 'pure_random': return (k) => this._state.callData.pureRandom[k];
+                    default: return () => [1,1];
+                }
+            }
+
+            _finishBenchmark(allTimes, subjects) {
+                this._ui.progressContainer.style.display = 'none';
+                const { runsToDiscard } = this.config;
+                const processedResults = allTimes.map((times, index) => {
+                    const validTimes = times.slice(runsToDiscard, -runsToDiscard).filter(t => t > 0);
+                    const average = validTimes.length > 0 ? validTimes.reduce((a, b) => a + b, 0) / validTimes.length : 0;
+                    return { name: subjects[index].name, average, allRuns: times, validRunsCount: validTimes.length };
+                });
+                
+                const scenarioInput = document.querySelector('input[name="scenario"]:checked');
+                const resetInput = document.querySelector('input[name="resetStrategy"]:checked');
+                this._state.history.unshift({
+                    timestamp: new Date(),
+                    scenario: scenarioInput.labels[0].textContent.trim(),
+                    resetStrategy: resetInput.labels[0].textContent.trim(),
+                    resetStrategyRaw: resetInput.value,
+                    results: processedResults, allTimes, subjects
+                });
+
+                this.updateHistoryUI();
+                this.renderResults(0);
+                this._ui.runBenchmarkBtn.disabled = false;
+                this._ui.runBenchmarkBtn.textContent = 'Run Benchmark Again';
+            }
+
+            _generateCallData() {
+                const counts = [63, ...Array(99).fill(0), 2, 2, 13, 1, 1, 6, 2, 1, 3, 2, 1, 2, 1, 1, 2, 2];
+                const validPairs = counts.flatMap((count, funcIndex) => Array.from({ length: count }, (_, i) => [funcIndex + 1, i + 1]));
+                const predictableRandom = [...validPairs];
+                for (let i = predictableRandom.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [predictableRandom[i], predictableRandom[j]] = [predictableRandom[j], predictableRandom[i]]; }
+                const pureRandom = Array.from({ length: this.config.iterationsPerRun }, () => validPairs[Math.floor(Math.random() * validPairs.length)]);
+                this._state.callData = { predictableRandom, pureRandom };
+            }
+
+            renderFullSubjectList() {
+                const checkedState = Object.fromEntries(Array.from(this._ui.subjectList.querySelectorAll('input[name="subject"]')).map(cb => [cb.value, cb.checked]));
+                const subjectsHtml = this._state.subjects.map(subject => this._buildSubjectHtml(subject, checkedState[subject.id] ?? true)).join('');
+                this._ui.subjectList.innerHTML = `<label style="font-weight: bold; display: block; margin-bottom: 10px; border-bottom: 1px solid var(--c-border); padding-bottom: 8px;"><input type="checkbox" id="checkAllSubjects"> Select All / None</label>${subjectsHtml}`;
+                this.updateCheckboxState();
+            }
+
+            _buildSubjectHtml(subject, isChecked) {
+                const deleteBtn = subject.isDynamic ? `<span class="delete-btn" data-id="${subject.id}" title="Delete this contestant">[x]</span>` : '';
+                return `<label><input type="checkbox" name="subject" value="${subject.id}" ${isChecked ? 'checked' : ''}> ${subject.name} ${deleteBtn}</label>`;
+            }
+
+            updateCheckboxState() {
+                const subjectCheckboxes = this._ui.subjectList.querySelectorAll('input[name="subject"]');
+                const allChecked = subjectCheckboxes.length > 0 && Array.from(subjectCheckboxes).every(c => c.checked);
+                const checkAll = this._ui.subjectList.querySelector('#checkAllSubjects');
+                if (checkAll) checkAll.checked = allChecked;
+            }
+
+            updateHistoryUI() {
+                this._ui.historyContainer.style.display = 'block';
+                this._ui.historyList.innerHTML = this._state.history.map((entry, index) =>
+                    `<li><a href="#" data-history-index="${index}">Run #${this._state.history.length - index}: ${entry.scenario} (${entry.resetStrategy}) - ${entry.timestamp.toLocaleTimeString()}</a></li>`
+                ).join('');
+            }
+
+            renderResults(historyIndex) {
+                const { results, allTimes, subjects, resetStrategyRaw } = this._state.history[historyIndex];
+                this._ui.historyList.querySelectorAll('li').forEach(li => li.classList.remove('active'));
+                this._ui.historyList.querySelector(`a[data-history-index="${historyIndex}"]`)?.parentElement.classList.add('active');
+                
+                const enhancedResults = this._calculateResultMetrics(results);
+                this._ui.resultsContainer.innerHTML = `
+                    <h2>Summary</h2>
+                    ${this._buildNotesHtml(resetStrategyRaw)}
+                    ${this._buildSummaryHtml(enhancedResults)}
+                    <div id="rawStatsContainer">${this._buildDetailsHtml(subjects, allTimes, resetStrategyRaw)}</div>
+                `;
+                this.toggleDetailsVisibility();
+            }
+
+            _calculateResultMetrics(results) {
+                const validAverages = results.map(r => r.average).filter(avg => avg > 0);
+                const baselineTime = validAverages.length > 0 ? Math.min(...validAverages) : 1;
+                return results.map(r => ({ ...r,
+                    multiplier: r.average > 0 ? r.average / baselineTime : 0,
+                    colorClass: r.average > 0 ? (r.average === baselineTime ? 'fast' : 'slow') : 'discarded'
+                }));
+            }
+
+            _buildSummaryHtml(results) {
+                return results.map(r => `<p class="summary-line">${r.name} average: <span class="${r.colorClass}">${r.average.toFixed(3)} ms ${r.multiplier > 0 ? `(${r.multiplier.toFixed(3)}x)` : '(failed)'}</span></p>`).join('');
+            }
+            
+            _buildDetailsHtml(subjects, allTimes, resetStrategyRaw) {
+                const { runsPerType, runsToDiscard } = this.config;
+                const detailsColumns = subjects.map((subject, j) => {
+                    const listItems = Array.from({ length: runsPerType }, (_, i) => {
+                        const isDiscarded = (i < runsToDiscard || i >= runsPerType - runsToDiscard);
+                        const time = allTimes[j]?.[i];
+                        let cssClass = (isDiscarded || !time) ? 'discarded' : '';
+                        if (!cssClass) {
+                            const rowTimes = allTimes.map(sTimes => sTimes?.[i] || Infinity);
+                            cssClass = time === Math.min(...rowTimes) ? 'fast' : 'slow';
+                        }
+                        const isInit = (resetStrategyRaw === 'perSample' && i === 0) || (resetStrategyRaw === 'perRun' && i === 0 && j === 0);
+                        const label = isInit ? `${i + 1} (Init):` : `${i + 1}:`;
+                        return `<li class="${cssClass}">${label} ${time?.toFixed(3) ?? 'N/A'} ms</li>`;
+                    }).join('');
+                    return `<div><h3>${subject.name} Raw</h3><ul class="details-list">${listItems}</ul></div>`;
+                }).join('');
+                return `<div class="details-columns">${detailsColumns}</div>`;
+            }
+
+            _buildNotesHtml(resetStrategyRaw) {
+                const { runsPerType, runsToDiscard } = this.config;
+                const validRunCount = runsPerType - (2 * runsToDiscard);
+                let note = `Averaging the middle ${validRunCount} of ${runsPerType} runs (discards first and last ${runsToDiscard}).`;
+                if (resetStrategyRaw === 'perRun') note += `<br><b>Note:</b> With this strategy, only the first sample of the first contestant includes init cost.`
+                else if (resetStrategyRaw === 'perSample') note += `<br><b>Note:</b> With this strategy, every sample includes init cost.`
+                return `<p style="font-size: 0.9em; color: var(--c-text-secondary);">${note}</p>`;
+            }
+            
+            updateScenarioInfo() { this._ui.scenarioInfo.innerHTML = this.config.scenarioDescriptions[document.querySelector('input[name="scenario"]:checked').value]; }
+            toggleDetailsVisibility() { document.getElementById('rawStatsContainer').style.display = this._ui.statsToggle.checked ? 'block' : 'none'; }
+
+            _handleFileLoad(event) {
+                const file = event.target.files[0]; if (!file) return; const reader = new FileReader();
+                reader.onload = (e) => { this._ui.evalCodeInput.value = e.target.result; };
+                reader.readAsText(file); event.target.value = '';
+            }
+            _handleSubjectListChange(e) {
+                if (e.target.id === 'checkAllSubjects') {
+                    this._ui.subjectList.querySelectorAll('input[name="subject"]').forEach(cb => { cb.checked = e.target.checked; });
+                }
+                this.updateCheckboxState();
+            }
+            _handleSubjectListClick(e) {
+                if (e.target.classList.contains('delete-btn')) {
+                    e.preventDefault(); e.stopPropagation(); this.removeDynamicContestant(e.target.dataset.id);
+                }
+            }
+            _handleHistoryClick(e) {
+                if (e.target.tagName === 'A' && e.target.dataset.historyIndex) {
+                     e.preventDefault(); this.renderResults(parseInt(e.target.dataset.historyIndex, 10));
+                }
+            }
+        }
+        window.app = new BenchmarkApp();
+    });
+</script>
+
+</body>
+</html>
